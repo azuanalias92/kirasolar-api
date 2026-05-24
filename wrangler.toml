@@ -1,0 +1,15 @@
+name = "kirasolar-api"
+main = "src/index.ts"
+compatibility_date = "2026-05-24"
+
+[observability]
+enabled = true
+
+[vars]
+GOOGLE_CLIENT_ID = "1004921240672-ong7k2d2fv3t1n6nfoen7d5cit6vptfi.apps.googleusercontent.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kirasolar-db"
+database_id = "06025e01-d786-4024-b539-ee0256ccfa92"
+migrations_dir = "migrations"
