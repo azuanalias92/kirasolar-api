@@ -42,6 +42,15 @@ type EvMonthlyUsageRow = {
   updated_at: string
 }
 
+type DailyUsageRow = {
+  user_id: string
+  date: string
+  peak_kwh: number
+  off_peak_kwh: number
+  created_at: string
+  updated_at: string
+}
+
 type TariffRateRow = {
   id: string
   tariff_type: string
@@ -388,6 +397,7 @@ function buildOpenApiSpec(origin: string) {
       { name: 'Auth' },
       { name: 'Calculator' },
       { name: 'EV Usage' },
+      { name: 'Daily Usage' },
       { name: 'Tariff Rates' },
       { name: 'Billing - ToU' },
       { name: 'Billing - Domestik Am' },
@@ -522,6 +532,26 @@ function buildOpenApiSpec(origin: string) {
             periodEnd: { type: 'string', example: '2026-04-15' },
           },
           required: ['usageKwh'],
+        },
+        DailyUsageItem: {
+          type: 'object',
+          properties: {
+            date: { type: 'string', example: '2026-05-01' },
+            peakKwh: { type: 'number' },
+            offPeakKwh: { type: 'number' },
+          },
+          required: ['date', 'peakKwh', 'offPeakKwh'],
+        },
+        DailyUsageSummaryItem: {
+          type: 'object',
+          properties: {
+            month: { type: 'integer', minimum: 1, maximum: 12 },
+            peakKwh: { type: 'number' },
+            offPeakKwh: { type: 'number' },
+            totalKwh: { type: 'number' },
+            billAmount: { type: 'number', nullable: true },
+          },
+          required: ['month', 'peakKwh', 'offPeakKwh', 'totalKwh', 'billAmount'],
         },
         Note: {
           type: 'object',
@@ -691,6 +721,84 @@ function buildOpenApiSpec(origin: string) {
               content: {
                 'application/json': {
                   schema: { type: 'object', properties: { years: { type: 'array', items: { type: 'integer' } } }, required: ['years'] },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/daily-usage': {
+        get: {
+          tags: ['Daily Usage'],
+          summary: 'Get daily ToU usage for a month',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'year', in: 'query', required: false, schema: { type: 'integer' } },
+            { name: 'month', in: 'query', required: false, schema: { type: 'integer', minimum: 1, maximum: 12 } },
+          ],
+          responses: {
+            '200': {
+              description: 'Daily readings',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      year: { type: 'integer' },
+                      month: { type: 'integer' },
+                      data: { type: 'array', items: { $ref: '#/components/schemas/DailyUsageItem' } },
+                    },
+                    required: ['year', 'month', 'data'],
+                  },
+                },
+              },
+            },
+          },
+        },
+        put: {
+          tags: ['Daily Usage'],
+          summary: 'Batch save/update daily ToU readings',
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: { type: 'array', items: { $ref: '#/components/schemas/DailyUsageItem' } },
+                  },
+                  required: ['data'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': { description: 'Saved' },
+          },
+        },
+      },
+      '/daily-usage/summary': {
+        get: {
+          tags: ['Daily Usage'],
+          summary: 'Get monthly usage summary with auto bill calculation',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'year', in: 'query', required: false, schema: { type: 'integer' } },
+          ],
+          responses: {
+            '200': {
+              description: 'Monthly summaries',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      year: { type: 'integer' },
+                      data: { type: 'array', items: { $ref: '#/components/schemas/DailyUsageSummaryItem' } },
+                    },
+                    required: ['year', 'data'],
+                  },
                 },
               },
             },
@@ -1132,6 +1240,176 @@ app.put('/ev-usage', async (c) => {
       evKwh: row?.ev_kwh ?? 0,
       nonEvKwh: row?.non_ev_kwh ?? 0,
     }
+  })
+
+  return c.json({ year, data })
+})
+
+// ── Daily Usage ─────────────────────────────────────────────
+
+app.get('/daily-usage', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
+  let year: number
+  let month: number | undefined
+  try {
+    year = parseYear(c.req.query('year'))
+    const m = c.req.query('month')
+    if (m !== undefined) {
+      month = Number.parseInt(m, 10)
+      if (!Number.isInteger(month) || month < 1 || month > 12) {
+        return c.json({ error: 'month must be 1..12' }, 400)
+      }
+    }
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : 'Invalid params' }, 400)
+  }
+
+  const datePrefix = month !== undefined
+    ? `${year}-${String(month).padStart(2, '0')}`
+    : `${year}`
+
+  const result = await c.env.DB.prepare(
+    'SELECT user_id, date, peak_kwh, off_peak_kwh, created_at, updated_at FROM daily_usage WHERE user_id = ?1 AND date LIKE ?2 ORDER BY date ASC',
+  )
+    .bind(user.id, `${datePrefix}%`)
+    .all<DailyUsageRow>()
+
+  const data = result.results.map((r) => ({
+    date: r.date,
+    peakKwh: r.peak_kwh,
+    offPeakKwh: r.off_peak_kwh,
+  }))
+
+  return c.json({ year, month: month ?? null, data })
+})
+
+app.put('/daily-usage', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
+  const body = await c.req.json().catch(() => ({}))
+  const itemsRaw = (body as Record<string, unknown>).data
+  if (!Array.isArray(itemsRaw)) return c.json({ error: 'data must be an array' }, 400)
+
+  const rows: Array<{ date: string; peakKwh: number; offPeakKwh: number }> = []
+  for (let i = 0; i < itemsRaw.length; i++) {
+    const item = itemsRaw[i]
+    if (typeof item !== 'object' || item === null) {
+      return c.json({ error: `data[${i}] must be an object` }, 400)
+    }
+    const rec = item as Record<string, unknown>
+    let date: string
+    let peakKwh: number
+    let offPeakKwh: number
+    try {
+      date = assertDateString(rec.date, `data[${i}].date`)
+      peakKwh = Math.max(0, assertNumber(rec.peakKwh, `data[${i}].peakKwh`))
+      offPeakKwh = Math.max(0, assertNumber(rec.offPeakKwh, `data[${i}].offPeakKwh`))
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : `Invalid data[${i}]` }, 400)
+    }
+    rows.push({ date, peakKwh, offPeakKwh })
+  }
+
+  if (rows.length === 0) return c.json({ error: 'No valid items' }, 400)
+
+  try {
+    const statements = rows.map((r) =>
+      c.env.DB.prepare(
+        'INSERT INTO daily_usage (user_id, date, peak_kwh, off_peak_kwh, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(user_id, date) DO UPDATE SET peak_kwh = excluded.peak_kwh, off_peak_kwh = excluded.off_peak_kwh, updated_at = CURRENT_TIMESTAMP',
+      ).bind(user.id, r.date, r.peakKwh, r.offPeakKwh),
+    )
+    await c.env.DB.batch(statements)
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : 'Failed to save' }, 500)
+  }
+
+  // Fetch back the saved data
+  const minDate = rows.reduce((a, b) => (a.date < b.date ? a : b)).date
+  const maxDate = rows.reduce((a, b) => (a.date > b.date ? a : b)).date
+  const result = await c.env.DB.prepare(
+    'SELECT user_id, date, peak_kwh, off_peak_kwh, created_at, updated_at FROM daily_usage WHERE user_id = ?1 AND date >= ?2 AND date <= ?3 ORDER BY date ASC',
+  )
+    .bind(user.id, minDate, maxDate)
+    .all<DailyUsageRow>()
+
+  const data = result.results.map((r) => ({
+    date: r.date,
+    peakKwh: r.peak_kwh,
+    offPeakKwh: r.off_peak_kwh,
+  }))
+
+  return c.json({ data })
+})
+
+app.get('/daily-usage/summary', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
+  let year: number
+  try {
+    year = parseYear(c.req.query('year'))
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : 'Invalid year' }, 400)
+  }
+
+  // Fetch all daily data for the year
+  const result = await c.env.DB.prepare(
+    "SELECT date, peak_kwh, off_peak_kwh FROM daily_usage WHERE user_id = ?1 AND date LIKE ?2 ORDER BY date ASC",
+  )
+    .bind(user.id, `${year}%`)
+    .all<{ date: string; peak_kwh: number; off_peak_kwh: number }>()
+
+  // Aggregate by month
+  const monthly = new Map<number, { peakKwh: number; offPeakKwh: number }>()
+  for (const row of result.results) {
+    const month = Number.parseInt(row.date.slice(5, 7), 10)
+    const existing = monthly.get(month) ?? { peakKwh: 0, offPeakKwh: 0 }
+    existing.peakKwh += row.peak_kwh
+    existing.offPeakKwh += row.off_peak_kwh
+    monthly.set(month, existing)
+  }
+
+  // Get the latest tariff rate for auto-bill calculation
+  const rate = await getTariffRate(c.env.DB, 'TNB_DOMESTIC_TOU', `${year}-12-31`)
+
+  const data = Array.from({ length: 12 }, (_, idx) => {
+    const month = idx + 1
+    const agg = monthly.get(month)
+    if (!agg) {
+      return { month, peakKwh: 0, offPeakKwh: 0, totalKwh: 0, billAmount: null }
+    }
+    const peakKwh = round2(agg.peakKwh)
+    const offPeakKwh = round2(agg.offPeakKwh)
+    const totalKwh = round2(peakKwh + offPeakKwh)
+
+    let billAmount: number | null = null
+    if (rate) {
+      const calc = calculateTnbDomesticTou({ peakKwh, offPeakKwh, rate })
+      billAmount = round2(calc.totalAmount)
+    }
+
+    return { month, peakKwh, offPeakKwh, totalKwh, billAmount }
   })
 
   return c.json({ year, data })
