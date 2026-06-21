@@ -943,21 +943,27 @@ const app = new Hono<{ Bindings: Env }>()
 
 app.use('*', logger())
 
-// Allowed frontend origins
+// Allowed frontend origin patterns
 const ALLOWED_ORIGINS = [
   'https://solar-calculator.vercel.app',
   'https://kirasolar.pages.dev',
 ]
 
+function isOriginAllowed(origin: string): boolean {
+  if (ALLOWED_ORIGINS.includes(origin)) return true
+  // Allow any Vercel preview deployment subdomain
+  if (origin.endsWith('.vercel.app')) return true
+  // Allow localhost in development
+  if (origin.startsWith('http://localhost:')) return true
+  return false
+}
+
 app.use(
   '*',
   cors({
     origin: (origin) => {
-      // Allow requests with no origin (server-to-server, mobile apps, curl)
       if (!origin) return origin
-      if (ALLOWED_ORIGINS.includes(origin)) return origin
-      // Allow localhost in development
-      if (origin.startsWith('http://localhost:')) return origin
+      if (isOriginAllowed(origin)) return origin
       return ALLOWED_ORIGINS[0]
     },
     allowHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
