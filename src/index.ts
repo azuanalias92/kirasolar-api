@@ -356,7 +356,6 @@ async function issueSessionToken(env: Env, user: SessionUser): Promise<string> {
     .setAudience('kirasolar-frontend')
     .setJti(crypto.randomUUID())
     .setIssuedAt()
-    .setNotBefore()
     .setExpirationTime('7d')
     .sign(secret)
 }
@@ -947,6 +946,7 @@ app.use('*', logger())
 // Allowed frontend origins — exact matches only, no wildcards
 const ALLOWED_ORIGINS = [
   'https://solar-calculator.vercel.app',
+  'https://solar-panel-estimator.vercel.app',
   'https://kirasolar.pages.dev',
 ]
 
@@ -954,6 +954,8 @@ function isOriginAllowed(origin: string): boolean {
   if (ALLOWED_ORIGINS.includes(origin)) return true
   // Allow Vercel preview deployments for the solar-calculator project only
   if (origin.match(/^https:\/\/solar-calculator-[a-z0-9-]+\.vercel\.app$/)) return true
+  // Allow Vercel preview deployments for the legacy solar-panel-estimator project
+  if (origin.match(/^https:\/\/solar-panel-estimator-[a-z0-9-]+\.vercel\.app$/)) return true
   // Allow localhost in development
   if (origin.startsWith('http://localhost:')) return true
   return false
@@ -965,7 +967,7 @@ app.use(
     origin: (origin) => {
       if (!origin) return origin
       if (isOriginAllowed(origin)) return origin
-      return ALLOWED_ORIGINS[0]
+      return ''
     },
     allowHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
     exposeHeaders: ['Content-Length'],
