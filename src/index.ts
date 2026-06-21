@@ -2,8 +2,6 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import { bodyLimit } from 'hono/body-limit'
-import { secureHeaders } from 'hono/secure-headers'
-import { rateLimiter } from 'hono/rate-limiter'
 import { SignJWT, createRemoteJWKSet, jwtVerify } from 'jose'
 
 type Env = {
@@ -969,24 +967,47 @@ app.use(
   }),
 )
 
-app.use('*', secureHeaders())
 app.use('*', bodyLimit({ maxSize: 1 * 1024 * 1024 })) // 1MB
-app.use(
-  '/auth/*',
-  rateLimiter({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    limit: 20,
-    keyGenerator: (c) => c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for') ?? 'unknown',
-  }),
-)
-app.use(
-  '*',
-  rateLimiter({
-    windowMs: 60 * 1000, // 1 minute
-    limit: 100,
-    keyGenerator: (c) => c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for') ?? 'unknown',
-  }),
-)
+
+// Security headers middleware
+app.use('*', async (c, next) => {
+  c.res.headers.set('X-Content-Type-Options', 'nosniff')
+  c.res.headers.set('X-Frame-Options', 'DENY')
+  c.res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin')
+  c.res.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+  await next()
+})
+
+// Simple in-memory rate limiter
+const rateLimitStore = new Map<string, { count: number; resetAt: number }>()
+
+function checkRateLimit(key: string, windowMs: number, limit: number): boolean {
+  const now = Date.now()
+  const entry = rateLimitStore.get(key)
+  if (!entry || now > entry.resetAt) {
+    rateLimitStore.set(key, { count: 1, resetAt: now + windowMs })
+    return true
+  }
+  if (entry.count >= limit) return false
+  entry.count++
+  return true
+}
+
+app.use('/auth/*', async (c, next) => {
+  const key = c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for') ?? 'unknown'
+  if (!checkRateLimit(`auth:${key}`, 15 * 60 * 1000, 20)) {
+    return c.json({ error: 'Too many requests. Please try again later.' }, 429)
+  }
+  await next()
+})
+
+app.use('*', async (c, next) => {
+  const key = c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for') ?? 'unknown'
+  if (!checkRateLimit(`global:${key}`, 60 * 1000, 100)) {
+    return c.json({ error: 'Too many requests. Please try again later.' }, 429)
+  }
+  await next()
+})
 
 app.get('/health', (c) => c.json({ ok: true }))
 
