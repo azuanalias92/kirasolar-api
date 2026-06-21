@@ -948,6 +948,8 @@ const ALLOWED_ORIGINS = [
   'https://solar-calculator.vercel.app',
   'https://solar-panel-estimator.vercel.app',
   'https://kirasolar.pages.dev',
+  'https://kirasolar.my',
+  'https://www.kirasolar.my',
 ]
 
 function isOriginAllowed(origin: string): boolean {
