@@ -6,8 +6,8 @@ compatibility_date = "2026-05-24"
 enabled = true
 
 [vars]
-# GOOGLE_CLIENT_ID is set via `wrangler secret put GOOGLE_CLIENT_ID`
-# Do NOT commit the actual value to this file.
+# GOOGLE_CLIENT_ID — this is a public OAuth identifier, safe to commit
+GOOGLE_CLIENT_ID = "1004921240672-ong7k2d2fv3t1n6nfoen7d5cit6vptfi.apps.googleusercontent.com"
 
 [[d1_databases]]
 binding = "DB"
