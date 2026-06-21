@@ -12,6 +12,7 @@ type Env = {
 
 type NoteRow = {
   id: string
+  user_id: string
   title: string
   content: string
   created_at: string
@@ -943,7 +944,7 @@ const app = new Hono<{ Bindings: Env }>()
 
 app.use('*', logger())
 
-// Allowed frontend origin patterns
+// Allowed frontend origins — exact matches only, no wildcards
 const ALLOWED_ORIGINS = [
   'https://solar-calculator.vercel.app',
   'https://kirasolar.pages.dev',
@@ -951,8 +952,8 @@ const ALLOWED_ORIGINS = [
 
 function isOriginAllowed(origin: string): boolean {
   if (ALLOWED_ORIGINS.includes(origin)) return true
-  // Allow any Vercel preview deployment subdomain
-  if (origin.endsWith('.vercel.app')) return true
+  // Allow Vercel preview deployments for the solar-calculator project only
+  if (origin.match(/^https:\/\/solar-calculator-[a-z0-9-]+\.vercel\.app$/)) return true
   // Allow localhost in development
   if (origin.startsWith('http://localhost:')) return true
   return false
@@ -969,7 +970,6 @@ app.use(
     allowHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
     exposeHeaders: ['Content-Length'],
     maxAge: 600,
-    credentials: true,
   }),
 )
 
@@ -981,37 +981,75 @@ app.use('*', async (c, next) => {
   c.res.headers.set('X-Frame-Options', 'DENY')
   c.res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin')
   c.res.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+  // Default CSP — strict for API responses (no scripts/styles allowed)
+  c.res.headers.set(
+    'Content-Security-Policy',
+    "default-src 'none'; frame-ancestors 'none'",
+  )
   await next()
 })
 
-// Simple in-memory rate limiter
-const rateLimitStore = new Map<string, { count: number; resetAt: number }>()
+// D1-backed rate limiter — works across Worker isolates
+const RATE_LIMIT_CLEANUP_CHANCE = 0.01 // 1% chance to prune expired rows per request
 
-function checkRateLimit(key: string, windowMs: number, limit: number): boolean {
+async function checkRateLimit(
+  db: D1Database,
+  key: string,
+  windowMs: number,
+  limit: number,
+): Promise<boolean> {
   const now = Date.now()
-  const entry = rateLimitStore.get(key)
-  if (!entry || now > entry.resetAt) {
-    rateLimitStore.set(key, { count: 1, resetAt: now + windowMs })
+
+  const row = await db
+    .prepare('SELECT count, reset_at FROM rate_limits WHERE key = ?1')
+    .bind(key)
+    .first<{ count: number; reset_at: number }>()
+
+  if (!row || now > row.reset_at) {
+    // Window expired or new key — insert fresh counter
+    await db
+      .prepare(
+        'INSERT INTO rate_limits (key, count, reset_at) VALUES (?1, 1, ?2) ON CONFLICT(key) DO UPDATE SET count = 1, reset_at = excluded.reset_at',
+      )
+      .bind(key, now + windowMs)
+      .run()
     return true
   }
-  if (entry.count >= limit) return false
-  entry.count++
+
+  if (row.count >= limit) return false
+
+  // Increment counter
+  await db
+    .prepare('UPDATE rate_limits SET count = count + 1 WHERE key = ?1')
+    .bind(key)
+    .run()
+
   return true
 }
 
+async function pruneExpiredRateLimits(db: D1Database): Promise<void> {
+  const threshold = Math.random() < RATE_LIMIT_CLEANUP_CHANCE
+  if (!threshold) return
+  await db
+    .prepare('DELETE FROM rate_limits WHERE reset_at < ?1')
+    .bind(Date.now())
+    .run()
+}
+
 app.use('/auth/*', async (c, next) => {
-  const key = c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for') ?? 'unknown'
-  if (!checkRateLimit(`auth:${key}`, 15 * 60 * 1000, 20)) {
+  const key = c.req.header('cf-connecting-ip') ?? 'unknown'
+  if (!(await checkRateLimit(c.env.DB, `auth:${key}`, 15 * 60 * 1000, 20))) {
     return c.json({ error: 'Too many requests. Please try again later.' }, 429)
   }
   await next()
 })
 
 app.use('*', async (c, next) => {
-  const key = c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for') ?? 'unknown'
-  if (!checkRateLimit(`global:${key}`, 60 * 1000, 100)) {
+  const key = c.req.header('cf-connecting-ip') ?? 'unknown'
+  if (!(await checkRateLimit(c.env.DB, `global:${key}`, 60 * 1000, 100))) {
     return c.json({ error: 'Too many requests. Please try again later.' }, 429)
   }
+  await pruneExpiredRateLimits(c.env.DB)
   await next()
 })
 
@@ -1029,11 +1067,11 @@ app.get('/docs', (c) => {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>KiraSolar API Docs</title>
-    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" integrity="sha384-9Q2fpS+xeS4ffJy6CagnwoUl+4ldAYhOs9pgZuEKxypVModhmZFzeMlvVsAjf7uT" crossorigin="anonymous" />
   </head>
   <body>
     <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" integrity="sha384-EYdOaiRwn44zNjrw+Tfs06qYz9BGQVo2f4/pLY5i7VorbjnZNhdplAbTBk8FXHUJ" crossorigin="anonymous"></script>
     <script>
       window.ui = SwaggerUIBundle({
         url: "/openapi.json",
@@ -1044,7 +1082,13 @@ app.get('/docs', (c) => {
     </script>
   </body>
 </html>`
-  return c.html(html)
+  // Override CSP for docs page to allow Swagger UI external resources + inline scripts
+  const response = c.html(html)
+  response.headers.set(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com; connect-src 'self' https://unpkg.com; img-src 'self' data:; frame-ancestors 'none'",
+  )
+  return response
 })
 
 app.post('/auth/google', async (c) => {
@@ -1783,9 +1827,9 @@ app.get('/notes', async (c) => {
   const limit = parseLimit(c.req.query('limit'))
 
   const result = await c.env.DB.prepare(
-    'SELECT id, title, content, created_at, updated_at FROM notes ORDER BY created_at DESC LIMIT ?1',
+    'SELECT id, user_id, title, content, created_at, updated_at FROM notes WHERE user_id = ?1 ORDER BY created_at DESC LIMIT ?2',
   )
-    .bind(limit)
+    .bind(user.id, limit)
     .all<NoteRow>()
 
   return c.json({ data: result.results })
@@ -1803,9 +1847,9 @@ app.get('/notes/:id', async (c) => {
 
   const id = c.req.param('id')
   const row = await c.env.DB.prepare(
-    'SELECT id, title, content, created_at, updated_at FROM notes WHERE id = ?1',
+    'SELECT id, user_id, title, content, created_at, updated_at FROM notes WHERE id = ?1 AND user_id = ?2',
   )
-    .bind(id)
+    .bind(id, user.id)
     .first<NoteRow>()
 
   if (!row) return c.json({ error: 'Not Found' }, 404)
@@ -1839,13 +1883,13 @@ app.post('/notes', async (c) => {
   const id = crypto.randomUUID()
 
   await c.env.DB.prepare(
-    "INSERT INTO notes (id, title, content, created_at, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    "INSERT INTO notes (id, user_id, title, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
   )
-    .bind(id, title, content)
+    .bind(id, user.id, title, content)
     .run()
 
   const created = await c.env.DB.prepare(
-    'SELECT id, title, content, created_at, updated_at FROM notes WHERE id = ?1',
+    'SELECT id, user_id, title, content, created_at, updated_at FROM notes WHERE id = ?1',
   )
     .bind(id)
     .first<NoteRow>()
@@ -1884,20 +1928,20 @@ app.put('/notes/:id', async (c) => {
     )
   }
 
-  const existing = await c.env.DB.prepare('SELECT id FROM notes WHERE id = ?1')
-    .bind(id)
+  const existing = await c.env.DB.prepare('SELECT id FROM notes WHERE id = ?1 AND user_id = ?2')
+    .bind(id, user.id)
     .first<{ id: string }>()
 
   if (!existing) return c.json({ error: 'Not Found' }, 404)
 
   await c.env.DB.prepare(
-    'UPDATE notes SET title = COALESCE(?2, title), content = COALESCE(?3, content), updated_at = CURRENT_TIMESTAMP WHERE id = ?1',
+    'UPDATE notes SET title = COALESCE(?2, title), content = COALESCE(?3, content), updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND user_id = ?4',
   )
-    .bind(id, title ?? null, content ?? null)
+    .bind(id, title ?? null, content ?? null, user.id)
     .run()
 
   const updated = await c.env.DB.prepare(
-    'SELECT id, title, content, created_at, updated_at FROM notes WHERE id = ?1',
+    'SELECT id, user_id, title, content, created_at, updated_at FROM notes WHERE id = ?1',
   )
     .bind(id)
     .first<NoteRow>()
@@ -1916,7 +1960,7 @@ app.delete('/notes/:id', async (c) => {
   }
 
   const id = c.req.param('id')
-  const result = await c.env.DB.prepare('DELETE FROM notes WHERE id = ?1').bind(id).run()
+  const result = await c.env.DB.prepare('DELETE FROM notes WHERE id = ?1 AND user_id = ?2').bind(id, user.id).run()
   if (result.meta.changes === 0) return c.json({ error: 'Not Found' }, 404)
   return c.body(null, 204)
 })
