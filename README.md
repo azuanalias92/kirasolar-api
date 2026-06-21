@@ -40,12 +40,12 @@ Swagger UI:
 Edit [wrangler.toml](file:///Users/azuanalias/Desktop/Personal/kirasolar-api/wrangler.toml) and set:
 
 - `[[d1_databases]].database_id`
-- `[vars].GOOGLE_CLIENT_ID`
 
-Set the session signing secret (never commit this):
+Set secrets (never commit these):
 
 ```bash
 wrangler secret put AUTH_SECRET
+wrangler secret put GOOGLE_CLIENT_ID
 ```
 
 ## Deploy

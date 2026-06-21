@@ -1,6 +1,9 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
+import { bodyLimit } from 'hono/body-limit'
+import { secureHeaders } from 'hono/secure-headers'
+import { rateLimiter } from 'hono/rate-limiter'
 import { SignJWT, createRemoteJWKSet, jwtVerify } from 'jose'
 
 type Env = {
@@ -352,7 +355,9 @@ async function issueSessionToken(env: Env, user: SessionUser): Promise<string> {
     .setSubject(user.id)
     .setIssuer('kirasolar-api')
     .setAudience('kirasolar-frontend')
+    .setJti(crypto.randomUUID())
     .setIssuedAt()
+    .setNotBefore()
     .setExpirationTime('7d')
     .sign(secret)
 }
@@ -939,11 +944,47 @@ function buildOpenApiSpec(origin: string) {
 const app = new Hono<{ Bindings: Env }>()
 
 app.use('*', logger())
+
+// Allowed frontend origins
+const ALLOWED_ORIGINS = [
+  'https://solar-calculator.vercel.app',
+  'https://kirasolar.pages.dev',
+]
+
 app.use(
   '*',
   cors({
-    origin: '*',
-    allowHeaders: ['Content-Type', 'Authorization'],
+    origin: (origin) => {
+      // Allow requests with no origin (server-to-server, mobile apps, curl)
+      if (!origin) return origin
+      if (ALLOWED_ORIGINS.includes(origin)) return origin
+      // Allow localhost in development
+      if (origin.startsWith('http://localhost:')) return origin
+      return ALLOWED_ORIGINS[0]
+    },
+    allowHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
+    exposeHeaders: ['Content-Length'],
+    maxAge: 600,
+    credentials: true,
+  }),
+)
+
+app.use('*', secureHeaders())
+app.use('*', bodyLimit({ maxSize: 1 * 1024 * 1024 })) // 1MB
+app.use(
+  '/auth/*',
+  rateLimiter({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    limit: 20,
+    keyGenerator: (c) => c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for') ?? 'unknown',
+  }),
+)
+app.use(
+  '*',
+  rateLimiter({
+    windowMs: 60 * 1000, // 1 minute
+    limit: 100,
+    keyGenerator: (c) => c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for') ?? 'unknown',
   }),
 )
 
@@ -1416,7 +1457,11 @@ app.get('/daily-usage/summary', async (c) => {
 })
 
 app.get('/tariff-rates', async (c) => {
+  const VALID_TARIFF_TYPES = ['TNB_DOMESTIC_TOU', 'TNB_DOMESTIC_AM']
   const tariffType = c.req.query('tariffType') ?? 'TNB_DOMESTIC_TOU'
+  if (!VALID_TARIFF_TYPES.includes(tariffType)) {
+    return c.json({ error: `Invalid tariffType. Must be one of: ${VALID_TARIFF_TYPES.join(', ')}` }, 400)
+  }
   const asOf = c.req.query('asOf') ?? new Date().toISOString().slice(0, 10)
 
   try {
@@ -1699,6 +1744,15 @@ app.get('/billing/tnb-domestic-am/bills', async (c) => {
 })
 
 app.get('/notes', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
   const limit = parseLimit(c.req.query('limit'))
 
   const result = await c.env.DB.prepare(
@@ -1711,6 +1765,15 @@ app.get('/notes', async (c) => {
 })
 
 app.get('/notes/:id', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
   const id = c.req.param('id')
   const row = await c.env.DB.prepare(
     'SELECT id, title, content, created_at, updated_at FROM notes WHERE id = ?1',
@@ -1723,6 +1786,15 @@ app.get('/notes/:id', async (c) => {
 })
 
 app.post('/notes', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
   const body = await c.req.json().catch(() => ({}))
 
   let title: string
@@ -1755,6 +1827,15 @@ app.post('/notes', async (c) => {
 })
 
 app.put('/notes/:id', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
   const id = c.req.param('id')
   const body = await c.req.json().catch(() => ({}))
   const titleRaw = (body as Record<string, unknown>).title
@@ -1798,6 +1879,15 @@ app.put('/notes/:id', async (c) => {
 })
 
 app.delete('/notes/:id', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
   const id = c.req.param('id')
   const result = await c.env.DB.prepare('DELETE FROM notes WHERE id = ?1').bind(id).run()
   if (result.meta.changes === 0) return c.json({ error: 'Not Found' }, 404)

@@ -10,7 +10,7 @@
     "db:migrate:remote": "wrangler d1 migrations apply kirasolar-db --remote"
   },
   "dependencies": {
-    "hono": "^4.5.0",
+    "hono": "^4.12.25",
     "jose": "^6.1.0"
   },
   "devDependencies": {
