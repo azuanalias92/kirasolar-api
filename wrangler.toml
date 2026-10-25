@@ -5,6 +5,10 @@ compatibility_date = "2026-05-24"
 [observability]
 enabled = true
 
+# Daily at 02:00 UTC (10:00 MYT): sync monthly AFA rates from myTNB.
+[triggers]
+crons = ["0 2 * * *"]
+
 [vars]
 # GOOGLE_CLIENT_ID — this is a public OAuth identifier, safe to commit
 GOOGLE_CLIENT_ID = "1004921240672-ong7k2d2fv3t1n6nfoen7d5cit6vptfi.apps.googleusercontent.com"

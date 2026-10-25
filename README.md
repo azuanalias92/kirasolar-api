@@ -62,6 +62,22 @@ Deploy:
 npm run deploy
 ```
 
+## Monthly AFA rates
+
+Bill estimates use each month's Automatic Fuel Adjustment (AFA) from the `afa_rates` table (RM/kWh, negative = rebate), and follow TNB's domestic rules: AFA, service tax and the RM10 retail charge only apply above 600 kWh a month (800 kWh for September to December 2026), service tax only covers usage above that threshold, the energy efficiency incentive is tiered by usage, and KWTBB applies above 300 kWh. The constants live next to `calculateDomesticBill` in `src/index.ts`.
+
+- A daily cron (`[triggers]` in `wrangler.toml`, 02:00 UTC) reads TNB's published table (`FUEL_BY_MONTH` in `https://www.mytnb.com.my/tariff/js/rates.js`) and upserts months up to the current Malaysian month. Later months in that file are projections and are ignored. If the fetch fails, existing rates are kept.
+- Months without a rate yet use the latest known rate, flagged `afaEstimated: true`.
+- To set a rate by hand (for example from a TNB press release):
+
+```bash
+npx wrangler d1 execute kirasolar-db --remote --command "INSERT INTO afa_rates (month, rate, source) VALUES ('2026-11', 0.0427, 'manual') ON CONFLICT(month) DO UPDATE SET rate = excluded.rate, source = excluded.source, updated_at = CURRENT_TIMESTAMP"
+```
+
+Note: the daily sync overwrites a month if myTNB later publishes a different value for it.
+
+- Test the sync locally: run `npm run dev`, then `curl "http://localhost:8787/cdn-cgi/local/scheduled"`.
+
 ## Main Endpoints
 
 - **Docs**
@@ -77,8 +93,11 @@ npm run deploy
   - `GET /ev-usage?year=YYYY`
   - `PUT /ev-usage?year=YYYY`
   - `GET /ev-usage/years`
+  - `GET /ev-sessions?year=YYYY` saved charging sessions
+  - `POST /ev-sessions` save sessions; already stored ones are skipped and only new sessions' kWh is added to the monthly totals
 - **Tariff Rates**
   - `GET /tariff-rates?tariffType=...&asOf=YYYY-MM-DD`
+  - `GET /afa-rates` monthly AFA rates
 - **Billing**
   - `POST /billing/tnb-domestic-tou/calculate`
   - `POST /billing/tnb-domestic-am/calculate`

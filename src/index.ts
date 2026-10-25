@@ -44,6 +44,25 @@ type EvMonthlyUsageRow = {
   updated_at: string
 }
 
+type EvChargingSessionRow = {
+  started_at: string
+  date: string
+  start_time: string
+  end_time: string
+  duration: string
+  kwh: number
+  cost: number
+}
+
+type EvChargingSession = {
+  date: string
+  startTime: string
+  endTime: string
+  duration: string
+  kwh: number
+  cost: number
+}
+
 type DailyUsageRow = {
   user_id: string
   date: string
@@ -217,13 +236,56 @@ async function getTariffRate(
     .first<TariffRateRow>()
 }
 
-function calculateTnbDomesticTou(input: {
-  peakKwh: number
-  offPeakKwh: number
-  rate: TariffRateRow
-}): {
-  peakKwh: number
-  offPeakKwh: number
+// ── TNB domestic bill rules ─────────────────────────────────
+// Mirrors TNB's own calculator (mytnb.com.my/tariff, js/rates.js and the domestic
+// calculators) for a single calendar month of usage.
+
+/** AFA, the retail charge and service tax only apply above this monthly usage. */
+const DOMESTIC_BASE_THRESHOLD_KWH = 600
+/** Temporary expanded protection: 800 kWh for usage from Sep to Dec 2026. */
+const DOMESTIC_PROTECTION = { thresholdKwh: 800, fromMonth: '2026-09', toMonth: '2026-12' }
+/** Above this monthly usage, energy is charged 10 sen/kWh more. */
+const HIGH_USAGE_THRESHOLD_KWH = 1500
+const HIGH_USAGE_ENERGY_SURCHARGE = 0.1
+/** KWTBB (Renewable Energy Fund, 1.6%) only applies above this monthly usage. */
+const KWTBB_THRESHOLD_KWH = 300
+/** Energy efficiency incentive (RM/kWh), chosen by total monthly usage. */
+const EFFICIENCY_INCENTIVE_TIERS: Array<{ maxKwh: number; rate: number }> = [
+  { maxKwh: 200, rate: -0.25 },
+  { maxKwh: 250, rate: -0.245 },
+  { maxKwh: 300, rate: -0.225 },
+  { maxKwh: 350, rate: -0.21 },
+  { maxKwh: 400, rate: -0.17 },
+  { maxKwh: 450, rate: -0.145 },
+  { maxKwh: 500, rate: -0.12 },
+  { maxKwh: 550, rate: -0.105 },
+  { maxKwh: 600, rate: -0.09 },
+  { maxKwh: 650, rate: -0.075 },
+  { maxKwh: 700, rate: -0.055 },
+  { maxKwh: 750, rate: -0.045 },
+  { maxKwh: 800, rate: -0.04 },
+  { maxKwh: 850, rate: -0.025 },
+  { maxKwh: 900, rate: -0.01 },
+  { maxKwh: 1000, rate: -0.005 },
+]
+
+/** Exemption threshold for a usage month ("YYYY-MM"). */
+function domesticThresholdKwh(month: string): number {
+  return month >= DOMESTIC_PROTECTION.fromMonth && month <= DOMESTIC_PROTECTION.toMonth
+    ? DOMESTIC_PROTECTION.thresholdKwh
+    : DOMESTIC_BASE_THRESHOLD_KWH
+}
+
+function efficiencyIncentiveRate(totalKwh: number): number {
+  return EFFICIENCY_INCENTIVE_TIERS.find((tier) => totalKwh <= tier.maxKwh)?.rate ?? 0
+}
+
+/** Rounds to sen, half away from zero (as TNB does). */
+function roundRm(value: number): number {
+  return Math.sign(value) * Math.round((Math.abs(value) + Number.EPSILON * Math.max(1, Math.abs(value))) * 100) / 100
+}
+
+type DomesticBillBreakdown = {
   totalKwh: number
   energyCharge: number
   afa: number
@@ -236,30 +298,73 @@ function calculateTnbDomesticTou(input: {
   serviceTax: number
   kwtbb: number
   totalAmount: number
-} {
+  afaRate: number
+  thresholdKwh: number
+}
+
+/**
+ * One month's domestic bill. Usage up to the threshold is exempt from service tax;
+ * AFA and the retail charge only apply when total usage is above the threshold.
+ * Peak usage takes the tax-free allowance first, as on TNB's ToU bills.
+ */
+function calculateDomesticBill(input: {
+  peakKwh: number
+  offPeakKwh: number
+  peakRate: number
+  offPeakRate: number
+  rate: TariffRateRow
+  afaRate: number
+  month: string
+}): DomesticBillBreakdown {
   const peakKwh = Math.max(0, input.peakKwh)
   const offPeakKwh = Math.max(0, input.offPeakKwh)
   const totalKwh = peakKwh + offPeakKwh
+  const thresholdKwh = domesticThresholdKwh(input.month)
+  const chargeable = totalKwh > thresholdKwh
 
-  const energyCharge = peakKwh * input.rate.peak_energy + offPeakKwh * input.rate.off_peak_energy
-  const afa = totalKwh * input.rate.afa_rate
-  const capacityCharge = totalKwh * input.rate.capacity_rate
-  const networkCharge = totalKwh * input.rate.network_rate
-  const retailCharge = totalKwh > 600 ? input.rate.retail_charge_rm : 0
-  const efficiencyIncentive = totalKwh * input.rate.efficiency_incentive_rate
+  const exemptKwh = Math.min(totalKwh, thresholdKwh)
+  const taxedKwh = totalKwh - exemptKwh
+  const peakExempt = Math.min(peakKwh, exemptKwh)
+  const offPeakExempt = exemptKwh - peakExempt
+  const peakTaxed = peakKwh - peakExempt
+  const offPeakTaxed = offPeakKwh - offPeakExempt
 
-  const subtotal = energyCharge + capacityCharge + networkCharge + retailCharge + afa + efficiencyIncentive
-  const taxableSubtotal = totalKwh > 600 ? subtotal : 0
-  const serviceTax = taxableSubtotal * input.rate.service_tax_rate
-  const kwtbb = subtotal * input.rate.kwtbb_rate
-  const totalAmount = subtotal + serviceTax + kwtbb
+  const highUsage = totalKwh > HIGH_USAGE_THRESHOLD_KWH ? HIGH_USAGE_ENERGY_SURCHARGE : 0
+  const peakRate = input.peakRate + highUsage
+  const offPeakRate = input.offPeakRate + highUsage
+
+  // Each charge is split into its tax-exempt and taxed parts, rounded separately.
+  const split = (exempt: number, taxed: number) => ({ exempt: roundRm(exempt), taxed: roundRm(taxed) })
+  // Peak and off-peak energy are rounded separately before being added.
+  const energy = {
+    exempt: roundRm(roundRm(peakExempt * peakRate) + roundRm(offPeakExempt * offPeakRate)),
+    taxed: roundRm(roundRm(peakTaxed * peakRate) + roundRm(offPeakTaxed * offPeakRate)),
+  }
+  const afaRate = chargeable ? input.afaRate : 0
+  const afa = split(exemptKwh * afaRate, taxedKwh * afaRate)
+  const capacity = split(exemptKwh * input.rate.capacity_rate, taxedKwh * input.rate.capacity_rate)
+  const network = split(exemptKwh * input.rate.network_rate, taxedKwh * input.rate.network_rate)
+  const incentiveRate = efficiencyIncentiveRate(totalKwh)
+  const incentive = { exempt: -roundRm(Math.abs(exemptKwh * incentiveRate)), taxed: -roundRm(Math.abs(taxedKwh * incentiveRate)) }
+  const retailCharge = chargeable ? input.rate.retail_charge_rm : 0
+
+  const total = (part: { exempt: number; taxed: number }) => roundRm(part.exempt + part.taxed)
+  const energyCharge = total(energy)
+  const capacityCharge = total(capacity)
+  const networkCharge = total(network)
+  const efficiencyIncentive = total(incentive)
+
+  const taxableSubtotal = roundRm(energy.taxed + afa.taxed + capacity.taxed + network.taxed + retailCharge + incentive.taxed)
+  const subtotal = roundRm(energyCharge + total(afa) + capacityCharge + networkCharge + retailCharge + efficiencyIncentive)
+  const serviceTax = roundRm(taxableSubtotal * input.rate.service_tax_rate)
+  const kwtbb = totalKwh > KWTBB_THRESHOLD_KWH
+    ? roundRm((energyCharge + capacityCharge + networkCharge + efficiencyIncentive) * input.rate.kwtbb_rate)
+    : 0
 
   return {
-    peakKwh,
-    offPeakKwh,
     totalKwh,
     energyCharge,
-    afa,
+    afa: total(afa),
     capacityCharge,
     networkCharge,
     retailCharge,
@@ -268,69 +373,113 @@ function calculateTnbDomesticTou(input: {
     taxableSubtotal,
     serviceTax,
     kwtbb,
-    totalAmount,
+    totalAmount: roundRm(subtotal + serviceTax + kwtbb),
+    afaRate: input.afaRate,
+    thresholdKwh,
   }
 }
 
-function prorateFactor(periodStart: string | undefined, periodEnd: string | undefined): number {
-  if (!periodStart || !periodEnd) return 1
-  const start = Date.parse(`${periodStart}T00:00:00Z`)
-  const end = Date.parse(`${periodEnd}T00:00:00Z`)
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 1
-  const days = Math.max(1, Math.round((end - start) / (1000 * 60 * 60 * 24)))
-  return Math.max(0, Math.min(2, days / 30))
+function calculateTnbDomesticTou(input: {
+  peakKwh: number
+  offPeakKwh: number
+  rate: TariffRateRow
+  afaRate: number
+  month: string
+}): DomesticBillBreakdown & { peakKwh: number; offPeakKwh: number } {
+  const bill = calculateDomesticBill({
+    ...input,
+    peakRate: input.rate.peak_energy,
+    offPeakRate: input.rate.off_peak_energy,
+  })
+  return { ...bill, peakKwh: Math.max(0, input.peakKwh), offPeakKwh: Math.max(0, input.offPeakKwh) }
 }
 
 function calculateTnbDomesticAm(input: {
   usageKwh: number
   rate: TariffRateRow
-  periodStart?: string
-  periodEnd?: string
-}): {
-  usageKwh: number
-  energyCharge: number
-  afa: number
-  capacityCharge: number
-  networkCharge: number
-  retailCharge: number
-  efficiencyIncentive: number
-  subtotal: number
-  taxableSubtotal: number
-  serviceTax: number
-  kwtbb: number
-  totalAmount: number
-} {
-  const usageKwh = Math.max(0, input.usageKwh)
+  afaRate: number
+  month: string
+}): DomesticBillBreakdown & { usageKwh: number } {
+  // Domestik Am has a single energy rate, so all usage is treated as one block.
+  const bill = calculateDomesticBill({
+    peakKwh: input.usageKwh,
+    offPeakKwh: 0,
+    peakRate: input.rate.peak_energy,
+    offPeakRate: input.rate.peak_energy,
+    rate: input.rate,
+    afaRate: input.afaRate,
+    month: input.month,
+  })
+  return { ...bill, usageKwh: Math.max(0, input.usageKwh) }
+}
 
-  const energyCharge = usageKwh * input.rate.peak_energy
-  const capacityCharge = usageKwh * input.rate.capacity_rate
-  const networkCharge = usageKwh * input.rate.network_rate
-  const retailCharge = usageKwh > 600 ? input.rate.retail_charge_rm : 0
-  const efficiencyIncentive = usageKwh * input.rate.efficiency_incentive_rate
+// ── Monthly AFA rates ───────────────────────────────────────
 
-  const afaFactor = usageKwh > 600 ? prorateFactor(input.periodStart, input.periodEnd) : 0
-  const afa = usageKwh > 600 ? usageKwh * input.rate.afa_rate * afaFactor : 0
+type AfaRateRow = { month: string; rate: number; source: string; updated_at: string }
+type AfaForMonth = { rate: number; month: string | null; estimated: boolean }
 
-  const subtotal = energyCharge + capacityCharge + networkCharge + retailCharge + afa + efficiencyIncentive
-  const taxableSubtotal = usageKwh > 600 ? subtotal : 0
-  const serviceTax = taxableSubtotal * input.rate.service_tax_rate
-  const kwtbb = subtotal * input.rate.kwtbb_rate
-  const totalAmount = subtotal + serviceTax + kwtbb
+/**
+ * The AFA for a usage month. When that month hasn't been announced yet, the latest
+ * earlier rate is used and flagged as estimated; with no data at all, the tariff's own
+ * afa_rate is the fallback.
+ */
+function pickAfaRate(rows: AfaRateRow[], month: string, fallback: number): AfaForMonth {
+  const exact = rows.find((r) => r.month === month)
+  if (exact) return { rate: exact.rate, month: exact.month, estimated: false }
+  const earlier = rows.filter((r) => r.month < month).sort((x, y) => y.month.localeCompare(x.month))[0]
+  if (earlier) return { rate: earlier.rate, month: earlier.month, estimated: true }
+  return { rate: fallback, month: null, estimated: true }
+}
 
-  return {
-    usageKwh,
-    energyCharge,
-    afa,
-    capacityCharge,
-    networkCharge,
-    retailCharge,
-    efficiencyIncentive,
-    subtotal,
-    taxableSubtotal,
-    serviceTax,
-    kwtbb,
-    totalAmount,
+async function loadAfaRates(db: D1Database): Promise<AfaRateRow[]> {
+  const result = await db.prepare('SELECT month, rate, source, updated_at FROM afa_rates ORDER BY month ASC').all<AfaRateRow>()
+  return result.results
+}
+
+async function afaForMonth(db: D1Database, month: string, fallback: number): Promise<AfaForMonth> {
+  return pickAfaRate(await loadAfaRates(db), month, fallback)
+}
+
+const MYTNB_RATES_URL = 'https://www.mytnb.com.my/tariff/js/rates.js'
+
+/** Current month in Malaysia (UTC+8), "YYYY-MM". */
+function malaysiaMonth(now = Date.now()): string {
+  return new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(0, 7)
+}
+
+/**
+ * Reads TNB's published monthly AFA table (FUEL_BY_MONTH in the myTNB calculator) and
+ * upserts months up to the current one. Later months in that file are projections, so
+ * they are ignored until their month arrives.
+ */
+async function syncAfaRates(db: D1Database): Promise<{ updated: number; skipped: number }> {
+  const res = await fetch(MYTNB_RATES_URL, { headers: { 'User-Agent': 'kirasolar-api (AFA sync)' } })
+  if (!res.ok) throw new Error(`myTNB rates.js responded ${res.status}`)
+  const js = await res.text()
+  const table = js.match(/FUEL_BY_MONTH\s*=\s*\{([\s\S]*?)\}/)
+  if (!table) throw new Error('FUEL_BY_MONTH not found in myTNB rates.js')
+
+  const current = malaysiaMonth()
+  const statements: D1PreparedStatement[] = []
+  let skipped = 0
+  for (const m of table[1].matchAll(/["'](\d{4}-\d{2})["']\s*:\s*([+-]?\d*\.?\d+)/g)) {
+    const month = m[1]
+    const rate = Number.parseFloat(m[2])
+    // Guard against projections and obviously wrong values (|AFA| is a few sen/kWh).
+    if (month > current || !Number.isFinite(rate) || Math.abs(rate) > 0.5) {
+      skipped++
+      continue
+    }
+    statements.push(
+      db.prepare(
+        "INSERT INTO afa_rates (month, rate, source, updated_at) VALUES (?1, ?2, 'mytnb', CURRENT_TIMESTAMP) ON CONFLICT(month) DO UPDATE SET rate = excluded.rate, source = excluded.source, updated_at = CURRENT_TIMESTAMP WHERE afa_rates.rate <> excluded.rate",
+      ).bind(month, rate),
+    )
   }
+  if (statements.length === 0) throw new Error('No AFA months parsed from myTNB rates.js')
+  const results = await db.batch(statements)
+  const updated = results.reduce((sum, r) => sum + (r.meta?.changes ?? 0), 0)
+  return { updated, skipped }
 }
 
 const googleJwks = createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'))
@@ -476,6 +625,18 @@ function buildOpenApiSpec(origin: string) {
             config: { $ref: '#/components/schemas/CalculatorConfig' },
           },
           required: ['items', 'config'],
+        },
+        EvChargingSession: {
+          type: 'object',
+          properties: {
+            date: { type: 'string', example: '2026-10-22' },
+            startTime: { type: 'string', example: '23:00:47' },
+            endTime: { type: 'string', example: '08:27:55' },
+            duration: { type: 'string', example: '09H27M' },
+            kwh: { type: 'number' },
+            cost: { type: 'number' },
+          },
+          required: ['date', 'startTime', 'endTime', 'kwh', 'cost'],
         },
         EvUsageItem: {
           type: 'object',
@@ -724,6 +885,76 @@ function buildOpenApiSpec(origin: string) {
               content: {
                 'application/json': {
                   schema: { type: 'object', properties: { years: { type: 'array', items: { type: 'integer' } } }, required: ['years'] },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/ev-sessions': {
+        get: {
+          tags: ['EV Usage'],
+          summary: 'List saved EV charging sessions for a year',
+          security: [{ bearerAuth: [] }],
+          parameters: [{ name: 'year', in: 'query', required: false, schema: { type: 'integer' } }],
+          responses: {
+            '200': {
+              description: 'Sessions',
+              content: { 'application/json': { schema: { type: 'object', properties: { year: { type: 'integer' }, data: { type: 'array', items: { $ref: '#/components/schemas/EvChargingSession' } } }, required: ['year', 'data'] } } },
+            },
+          },
+        },
+        post: {
+          tags: ['EV Usage'],
+          summary: 'Save EV charging sessions; new ones are added to the monthly EV totals, already stored ones are skipped',
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    sessions: { type: 'array', maxItems: 200, items: { $ref: '#/components/schemas/EvChargingSession' } },
+                    alreadyCounted: { type: 'array', items: { type: 'string' }, description: 'Keys "YYYY-MM-DD HH:MM:SS" whose kWh is already in the monthly totals' },
+                  },
+                  required: ['sessions'],
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Result',
+              content: { 'application/json': { schema: { type: 'object', properties: { saved: { type: 'integer' }, skipped: { type: 'integer' }, countedKwh: { type: 'number' }, years: { type: 'array', items: { type: 'integer' } } }, required: ['saved', 'skipped', 'countedKwh', 'years'] } } },
+            },
+          },
+        },
+      },
+      '/afa-rates': {
+        get: {
+          tags: ['Tariff Rates'],
+          summary: 'Monthly AFA (Automatic Fuel Adjustment) rates in RM/kWh, synced daily from myTNB',
+          responses: {
+            '200': {
+              description: 'AFA rates by month',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      data: {
+                        type: 'array',
+                        items: {
+                          type: 'object',
+                          properties: { month: { type: 'string' }, rate: { type: 'number' }, source: { type: 'string' }, updatedAt: { type: 'string' } },
+                          required: ['month', 'rate', 'source', 'updatedAt'],
+                        },
+                      },
+                      currentMonth: { type: 'string' },
+                    },
+                    required: ['data', 'currentMonth'],
+                  },
                 },
               },
             },
@@ -1383,6 +1614,174 @@ app.put('/ev-usage', async (c) => {
   return c.json({ year, data })
 })
 
+// ── EV Charging Sessions ────────────────────────────────────
+
+const MAX_SESSIONS_PER_REQUEST = 200
+
+/** "8:05" or "08:05:09" → "08:05:09". */
+function normaliseTime(value: unknown, fieldName: string): string {
+  const s = assertString(value, fieldName)
+  const m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/)
+  if (!m || Number(m[1]) > 23 || Number(m[2]) > 59 || Number(m[3] ?? 0) > 59) {
+    throw new Error(`${fieldName} must be HH:MM or HH:MM:SS`)
+  }
+  return `${m[1].padStart(2, '0')}:${m[2]}:${m[3] ?? '00'}`
+}
+
+function parseChargingSession(value: unknown, idx: number): EvChargingSession {
+  if (typeof value !== 'object' || value === null) throw new Error(`sessions[${idx}] must be an object`)
+  const rec = value as Record<string, unknown>
+  const date = assertDateString(rec.date, `sessions[${idx}].date`)
+  parseYear(date.slice(0, 4))
+  const duration = assertString(rec.duration ?? '-', `sessions[${idx}].duration`).slice(0, 16)
+  const kwh = assertNumber(rec.kwh, `sessions[${idx}].kwh`)
+  const cost = assertNumber(rec.cost, `sessions[${idx}].cost`)
+  if (kwh < 0 || kwh > 1000) throw new Error(`sessions[${idx}].kwh must be between 0 and 1000`)
+  if (cost < 0 || cost > 100000) throw new Error(`sessions[${idx}].cost must be between 0 and 100000`)
+  return {
+    date,
+    startTime: normaliseTime(rec.startTime, `sessions[${idx}].startTime`),
+    endTime: normaliseTime(rec.endTime, `sessions[${idx}].endTime`),
+    duration,
+    kwh,
+    cost,
+  }
+}
+
+const sessionStartedAt = (s: EvChargingSession) => `${s.date} ${s.startTime}`
+
+app.get('/ev-sessions', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
+  let year: number
+  try {
+    year = parseYear(c.req.query('year'))
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : 'Invalid year' }, 400)
+  }
+
+  const result = await c.env.DB.prepare(
+    'SELECT started_at, date, start_time, end_time, duration, kwh, cost FROM ev_charging_sessions WHERE user_id = ?1 AND date LIKE ?2 ORDER BY started_at ASC',
+  )
+    .bind(user.id, `${year}-%`)
+    .all<EvChargingSessionRow>()
+
+  const data: EvChargingSession[] = result.results.map((r) => ({
+    date: r.date,
+    startTime: r.start_time,
+    endTime: r.end_time,
+    duration: r.duration,
+    kwh: r.kwh,
+    cost: r.cost,
+  }))
+  return c.json({ year, data })
+})
+
+/**
+ * Saves charging sessions and adds the kWh of newly saved ones to the monthly EV totals.
+ * Sessions that are already stored are skipped. Keys in `alreadyCounted`
+ * ("YYYY-MM-DD HH:MM:SS") are stored without adding their kWh again, for sessions
+ * whose kWh was counted before individual sessions were kept.
+ */
+app.post('/ev-sessions', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>
+  if (!Array.isArray(body.sessions)) return c.json({ error: 'sessions must be an array' }, 400)
+  if (body.sessions.length > MAX_SESSIONS_PER_REQUEST) {
+    return c.json({ error: `At most ${MAX_SESSIONS_PER_REQUEST} sessions per request` }, 400)
+  }
+
+  let submitted: EvChargingSession[]
+  try {
+    submitted = body.sessions.map(parseChargingSession)
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : 'Invalid sessions' }, 400)
+  }
+  const alreadyCounted = new Set(
+    Array.isArray(body.alreadyCounted) ? body.alreadyCounted.filter((k): k is string => typeof k === 'string') : [],
+  )
+
+  // Dedupe within the request, then drop sessions that are already stored.
+  const byKey = new Map(submitted.map((s) => [sessionStartedAt(s), s]))
+  const keys = Array.from(byKey.keys())
+  const existing = new Set<string>()
+  const KEYS_PER_QUERY = 90 // D1 allows 100 bound parameters per query
+  for (let i = 0; i < keys.length; i += KEYS_PER_QUERY) {
+    const chunk = keys.slice(i, i + KEYS_PER_QUERY)
+    const placeholders = chunk.map((_, j) => `?${j + 2}`).join(', ')
+    const found = await c.env.DB.prepare(
+      `SELECT started_at FROM ev_charging_sessions WHERE user_id = ?1 AND started_at IN (${placeholders})`,
+    )
+      .bind(user.id, ...chunk)
+      .all<{ started_at: string }>()
+    for (const r of found.results) existing.add(r.started_at)
+  }
+  const fresh = keys.filter((k) => !existing.has(k)).map((k) => byKey.get(k)!)
+
+  // kWh to add per (year, month), excluding sessions that were already counted.
+  const added = new Map<string, { year: number; month: number; kwh: number }>()
+  let countedKwh = 0
+  for (const s of fresh) {
+    if (alreadyCounted.has(sessionStartedAt(s))) continue
+    const year = Number.parseInt(s.date.slice(0, 4), 10)
+    const month = Number.parseInt(s.date.slice(5, 7), 10)
+    const key = `${year}-${month}`
+    const entry = added.get(key) ?? { year, month, kwh: 0 }
+    entry.kwh += s.kwh
+    countedKwh += s.kwh
+    added.set(key, entry)
+  }
+
+  // One batch (a single transaction): store sessions and update monthly totals together.
+  const statements: D1PreparedStatement[] = []
+  const ROWS_PER_INSERT = 12 // 8 parameters per row, under D1's 100-parameter limit
+  for (let i = 0; i < fresh.length; i += ROWS_PER_INSERT) {
+    const chunk = fresh.slice(i, i + ROWS_PER_INSERT)
+    const values = chunk.map((_, j) => `(${Array.from({ length: 8 }, (_, k) => `?${j * 8 + k + 1}`).join(', ')}, CURRENT_TIMESTAMP)`).join(', ')
+    statements.push(
+      c.env.DB.prepare(
+        `INSERT INTO ev_charging_sessions (user_id, started_at, date, start_time, end_time, duration, kwh, cost, created_at) VALUES ${values} ON CONFLICT(user_id, started_at) DO NOTHING`,
+      ).bind(...chunk.flatMap((s) => [user.id, sessionStartedAt(s), s.date, s.startTime, s.endTime, s.duration, s.kwh, s.cost])),
+    )
+  }
+  for (const a of added.values()) {
+    statements.push(
+      c.env.DB.prepare(
+        'INSERT INTO ev_monthly_usage (user_id, year, month, ev_kwh, non_ev_kwh, updated_at) VALUES (?1, ?2, ?3, ?4, 0, CURRENT_TIMESTAMP) ON CONFLICT(user_id, year, month) DO UPDATE SET ev_kwh = ev_monthly_usage.ev_kwh + excluded.ev_kwh, updated_at = CURRENT_TIMESTAMP',
+      ).bind(user.id, a.year, a.month, a.kwh),
+    )
+  }
+  if (statements.length > 0) {
+    try {
+      await c.env.DB.batch(statements)
+    } catch {
+      return c.json({ error: 'Failed to save' }, 500)
+    }
+  }
+
+  return c.json({
+    saved: fresh.length,
+    skipped: keys.length - fresh.length,
+    countedKwh: round2(countedKwh),
+    years: Array.from(new Set(fresh.map((s) => Number.parseInt(s.date.slice(0, 4), 10)))).sort((x, y) => x - y),
+  })
+})
+
 // ── Daily Usage ─────────────────────────────────────────────
 
 app.get('/daily-usage', async (c) => {
@@ -1558,29 +1957,44 @@ app.get('/daily-usage/summary', async (c) => {
     monthly.set(month, existing)
   }
 
-  // Get the latest tariff rate for auto-bill calculation
-  const rate = await getTariffRate(c.env.DB, 'TNB_DOMESTIC_TOU', `${year}-12-31`)
+  // Each month is billed with the tariff in force at its end and that month's AFA.
+  const tariffs = await c.env.DB.prepare(
+    "SELECT id, tariff_type, effective_date, peak_energy, off_peak_energy, capacity_rate, network_rate, retail_charge_rm, afa_rate, efficiency_incentive_rate, service_tax_rate, kwtbb_rate FROM tariff_rates WHERE tariff_type = 'TNB_DOMESTIC_TOU' ORDER BY effective_date ASC",
+  ).all<TariffRateRow>()
+  const afaRows = await loadAfaRates(c.env.DB)
 
   const data = Array.from({ length: 12 }, (_, idx) => {
     const month = idx + 1
     const agg = monthly.get(month)
     if (!agg) {
-      return { month, peakKwh: 0, offPeakKwh: 0, totalKwh: 0, billAmount: null }
+      return { month, peakKwh: 0, offPeakKwh: 0, totalKwh: 0, billAmount: null, afaRate: null, afaEstimated: null }
     }
     const peakKwh = round2(agg.peakKwh)
     const offPeakKwh = round2(agg.offPeakKwh)
     const totalKwh = round2(peakKwh + offPeakKwh)
 
-    let billAmount: number | null = null
-    if (rate) {
-      const calc = calculateTnbDomesticTou({ peakKwh, offPeakKwh, rate })
-      billAmount = round2(calc.totalAmount)
+    const monthKey = `${year}-${String(month).padStart(2, '0')}`
+    const monthEnd = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10)
+    // Before the earliest stored tariff, fall back to it rather than show no estimate.
+    const rate = tariffs.results.filter((r) => r.effective_date <= monthEnd).pop() ?? tariffs.results[0]
+    if (!rate) {
+      return { month, peakKwh, offPeakKwh, totalKwh, billAmount: null, afaRate: null, afaEstimated: null }
     }
 
-    return { month, peakKwh, offPeakKwh, totalKwh, billAmount }
+    const afa = pickAfaRate(afaRows, monthKey, rate.afa_rate)
+    const calc = calculateTnbDomesticTou({ peakKwh, offPeakKwh, rate, afaRate: afa.rate, month: monthKey })
+    return { month, peakKwh, offPeakKwh, totalKwh, billAmount: round2(calc.totalAmount), afaRate: afa.rate, afaEstimated: afa.estimated }
   })
 
   return c.json({ year, data })
+})
+
+app.get('/afa-rates', async (c) => {
+  const rows = await loadAfaRates(c.env.DB)
+  return c.json({
+    data: rows.map((r) => ({ month: r.month, rate: r.rate, source: r.source, updatedAt: r.updated_at })),
+    currentMonth: malaysiaMonth(),
+  })
 })
 
 app.get('/tariff-rates', async (c) => {
@@ -1619,7 +2033,9 @@ app.post('/billing/tnb-domestic-tou/calculate', async (c) => {
   const rate = await getTariffRate(c.env.DB, 'TNB_DOMESTIC_TOU', asOfDate)
   if (!rate) return c.json({ error: 'No tariff rate found' }, 404)
 
-  const calc = calculateTnbDomesticTou({ peakKwh, offPeakKwh, rate })
+  const month = asOfDate.slice(0, 7)
+  const afa = await afaForMonth(c.env.DB, month, rate.afa_rate)
+  const calc = calculateTnbDomesticTou({ peakKwh, offPeakKwh, rate, afaRate: afa.rate, month })
 
   return c.json({
     tariff: rate,
@@ -1639,6 +2055,10 @@ app.post('/billing/tnb-domestic-tou/calculate', async (c) => {
       kwtbb: round2(calc.kwtbb),
       totalAmount: round2(calc.totalAmount),
       currency: 'MYR',
+      afaRate: afa.rate,
+      afaMonth: afa.month,
+      afaEstimated: afa.estimated,
+      thresholdKwh: calc.thresholdKwh,
     },
   })
 })
@@ -1664,7 +2084,10 @@ app.post('/billing/tnb-domestic-am/calculate', async (c) => {
   const rate = await getTariffRate(c.env.DB, 'TNB_DOMESTIC_AM', asOfDate)
   if (!rate) return c.json({ error: 'No tariff rate found' }, 404)
 
-  const calc = calculateTnbDomesticAm({ usageKwh, rate, periodStart, periodEnd })
+  // AFA follows the usage month: the period's end if given, otherwise the as-of date.
+  const month = (periodEnd ?? asOfDate).slice(0, 7)
+  const afa = await afaForMonth(c.env.DB, month, rate.afa_rate)
+  const calc = calculateTnbDomesticAm({ usageKwh, rate, afaRate: afa.rate, month })
 
   return c.json({
     tariff: rate,
@@ -1682,6 +2105,10 @@ app.post('/billing/tnb-domestic-am/calculate', async (c) => {
       kwtbb: round2(calc.kwtbb),
       totalAmount: round2(calc.totalAmount),
       currency: 'MYR',
+      afaRate: afa.rate,
+      afaMonth: afa.month,
+      afaEstimated: afa.estimated,
+      thresholdKwh: calc.thresholdKwh,
     },
   })
 })
@@ -1718,7 +2145,9 @@ app.post('/billing/tnb-domestic-tou/bills', async (c) => {
   const rate = await getTariffRate(c.env.DB, 'TNB_DOMESTIC_TOU', asOfDate)
   if (!rate) return c.json({ error: 'No tariff rate found' }, 404)
 
-  const calc = calculateTnbDomesticTou({ peakKwh, offPeakKwh, rate })
+  const month = asOfDate.slice(0, 7)
+  const afa = await afaForMonth(c.env.DB, month, rate.afa_rate)
+  const calc = calculateTnbDomesticTou({ peakKwh, offPeakKwh, rate, afaRate: afa.rate, month })
   const id = crypto.randomUUID()
 
   await c.env.DB.prepare(
@@ -1809,7 +2238,10 @@ app.post('/billing/tnb-domestic-am/bills', async (c) => {
   const rate = await getTariffRate(c.env.DB, 'TNB_DOMESTIC_AM', asOfDate)
   if (!rate) return c.json({ error: 'No tariff rate found' }, 404)
 
-  const calc = calculateTnbDomesticAm({ usageKwh, rate, periodStart, periodEnd })
+  // AFA follows the usage month: the period's end if given, otherwise the as-of date.
+  const month = (periodEnd ?? asOfDate).slice(0, 7)
+  const afa = await afaForMonth(c.env.DB, month, rate.afa_rate)
+  const calc = calculateTnbDomesticAm({ usageKwh, rate, afaRate: afa.rate, month })
   const id = crypto.randomUUID()
 
   await c.env.DB.prepare(
@@ -2028,4 +2460,14 @@ app.onError((err, c) => {
   return c.json({ error: 'Internal Server Error' }, 500)
 })
 
-export default app
+export default {
+  fetch: app.fetch,
+  // Daily cron (see wrangler.toml): keep monthly AFA rates current from myTNB.
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(
+      syncAfaRates(env.DB)
+        .then((r) => console.log(`AFA sync: ${r.updated} month(s) updated, ${r.skipped} skipped`))
+        .catch((err) => console.error('AFA sync failed; keeping existing rates', err)),
+    )
+  },
+} satisfies ExportedHandler<Env>
