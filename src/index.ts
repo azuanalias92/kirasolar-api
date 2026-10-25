@@ -781,6 +781,23 @@ function buildOpenApiSpec(origin: string) {
           },
         },
       },
+      '/daily-usage/years': {
+        get: {
+          tags: ['Daily Usage'],
+          summary: 'List years that have daily usage data',
+          security: [{ bearerAuth: [] }],
+          responses: {
+            '200': {
+              description: 'Years',
+              content: {
+                'application/json': {
+                  schema: { type: 'object', properties: { years: { type: 'array', items: { type: 'integer' } } }, required: ['years'] },
+                },
+              },
+            },
+          },
+        },
+      },
       '/daily-usage/summary': {
         get: {
           tags: ['Daily Usage'],
@@ -1306,23 +1323,28 @@ app.put('/ev-usage', async (c) => {
   const itemsRaw = (body as Record<string, unknown>).data
   if (!Array.isArray(itemsRaw)) return c.json({ error: 'data must be an array' }, 400)
 
-  const rows = itemsRaw
-    .map((item, idx) => {
-      if (typeof item !== 'object' || item === null) {
-        throw new Error(`data[${idx}] must be an object`)
-      }
-      const rec = item as Record<string, unknown>
-      const month = assertNumber(rec.month, `data[${idx}].month`)
-      const evKwh = assertNumber(rec.evKwh, `data[${idx}].evKwh`)
-      const nonEvKwh = assertNumber(rec.nonEvKwh, `data[${idx}].nonEvKwh`)
-      if (!Number.isInteger(month) || month < 1 || month > 12) {
-        throw new Error(`data[${idx}].month must be an integer 1..12`)
-      }
-      const ev = Math.max(0, evKwh)
-      const nonEv = Math.max(0, nonEvKwh)
-      return { month, evKwh: ev, nonEvKwh: nonEv }
-    })
-    .slice(0, 12)
+  let rows: Array<{ month: number; evKwh: number; nonEvKwh: number }>
+  try {
+    rows = itemsRaw
+      .map((item, idx) => {
+        if (typeof item !== 'object' || item === null) {
+          throw new Error(`data[${idx}] must be an object`)
+        }
+        const rec = item as Record<string, unknown>
+        const month = assertNumber(rec.month, `data[${idx}].month`)
+        const evKwh = assertNumber(rec.evKwh, `data[${idx}].evKwh`)
+        const nonEvKwh = assertNumber(rec.nonEvKwh, `data[${idx}].nonEvKwh`)
+        if (!Number.isInteger(month) || month < 1 || month > 12) {
+          throw new Error(`data[${idx}].month must be an integer 1..12`)
+        }
+        const ev = Math.max(0, evKwh)
+        const nonEv = Math.max(0, nonEvKwh)
+        return { month, evKwh: ev, nonEvKwh: nonEv }
+      })
+      .slice(0, 12)
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : 'Invalid request body' }, 400)
+  }
 
   try {
     const statements = rows.map((r) =>
@@ -1444,11 +1466,21 @@ app.put('/daily-usage', async (c) => {
   if (rows.length === 0) return c.json({ error: 'No valid items' }, 400)
 
   try {
-    const statements = rows.map((r) =>
-      c.env.DB.prepare(
-        'INSERT INTO daily_usage (user_id, date, peak_kwh, off_peak_kwh, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(user_id, date) DO UPDATE SET peak_kwh = excluded.peak_kwh, off_peak_kwh = excluded.off_peak_kwh, updated_at = CURRENT_TIMESTAMP',
-      ).bind(user.id, r.date, r.peakKwh, r.offPeakKwh),
-    )
+    // One multi-row upsert per chunk keeps the query count low (D1 limits queries per
+    // invocation) while staying under D1's 100 bound parameters per query (4 per row).
+    const ROWS_PER_STATEMENT = 25
+    const statements: D1PreparedStatement[] = []
+    for (let i = 0; i < rows.length; i += ROWS_PER_STATEMENT) {
+      const chunk = rows.slice(i, i + ROWS_PER_STATEMENT)
+      const values = chunk
+        .map((_, j) => `(?${j * 4 + 1}, ?${j * 4 + 2}, ?${j * 4 + 3}, ?${j * 4 + 4}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+        .join(', ')
+      statements.push(
+        c.env.DB.prepare(
+          `INSERT INTO daily_usage (user_id, date, peak_kwh, off_peak_kwh, created_at, updated_at) VALUES ${values} ON CONFLICT(user_id, date) DO UPDATE SET peak_kwh = excluded.peak_kwh, off_peak_kwh = excluded.off_peak_kwh, updated_at = CURRENT_TIMESTAMP`,
+        ).bind(...chunk.flatMap((r) => [user.id, r.date, r.peakKwh, r.offPeakKwh])),
+      )
+    }
     await c.env.DB.batch(statements)
   } catch (err) {
     return c.json({ error: err instanceof Error ? err.message : 'Failed to save' }, 500)
@@ -1470,6 +1502,26 @@ app.put('/daily-usage', async (c) => {
   }))
 
   return c.json({ data })
+})
+
+app.get('/daily-usage/years', async (c) => {
+  if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
+
+  let user: SessionUser
+  try {
+    user = await requireUser(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
+  const result = await c.env.DB.prepare(
+    'SELECT DISTINCT CAST(substr(date, 1, 4) AS INTEGER) AS year FROM daily_usage WHERE user_id = ?1 ORDER BY year DESC',
+  )
+    .bind(user.id)
+    .all<{ year: number }>()
+
+  const years = result.results.map((r) => r.year)
+  return c.json({ years })
 })
 
 app.get('/daily-usage/summary', async (c) => {
