@@ -916,7 +916,6 @@ function buildOpenApiSpec(origin: string) {
                   type: 'object',
                   properties: {
                     sessions: { type: 'array', maxItems: 200, items: { $ref: '#/components/schemas/EvChargingSession' } },
-                    alreadyCounted: { type: 'array', items: { type: 'string' }, description: 'Keys "YYYY-MM-DD HH:MM:SS" whose kWh is already in the monthly totals' },
                   },
                   required: ['sessions'],
                 },
@@ -1686,9 +1685,7 @@ app.get('/ev-sessions', async (c) => {
 
 /**
  * Saves charging sessions and adds the kWh of newly saved ones to the monthly EV totals.
- * Sessions that are already stored are skipped. Keys in `alreadyCounted`
- * ("YYYY-MM-DD HH:MM:SS") are stored without adding their kWh again, for sessions
- * whose kWh was counted before individual sessions were kept.
+ * Sessions that are already stored are skipped.
  */
 app.post('/ev-sessions', async (c) => {
   if (!c.env.AUTH_SECRET) return c.json({ error: 'Server misconfigured' }, 500)
@@ -1712,9 +1709,6 @@ app.post('/ev-sessions', async (c) => {
   } catch (err) {
     return c.json({ error: err instanceof Error ? err.message : 'Invalid sessions' }, 400)
   }
-  const alreadyCounted = new Set(
-    Array.isArray(body.alreadyCounted) ? body.alreadyCounted.filter((k): k is string => typeof k === 'string') : [],
-  )
 
   // Dedupe within the request, then drop sessions that are already stored.
   const byKey = new Map(submitted.map((s) => [sessionStartedAt(s), s]))
@@ -1733,11 +1727,10 @@ app.post('/ev-sessions', async (c) => {
   }
   const fresh = keys.filter((k) => !existing.has(k)).map((k) => byKey.get(k)!)
 
-  // kWh to add per (year, month), excluding sessions that were already counted.
+  // kWh to add per (year, month).
   const added = new Map<string, { year: number; month: number; kwh: number }>()
   let countedKwh = 0
   for (const s of fresh) {
-    if (alreadyCounted.has(sessionStartedAt(s))) continue
     const year = Number.parseInt(s.date.slice(0, 4), 10)
     const month = Number.parseInt(s.date.slice(5, 7), 10)
     const key = `${year}-${month}`
